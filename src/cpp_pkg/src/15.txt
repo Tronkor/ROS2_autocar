@@ -1,0 +1,388 @@
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include <cmath>
+#include <mutex>  // 互斥锁头文件
+
+#define SPEED 1554   // 默认前进速度值
+
+// 极坐标结构
+struct PointPolar {   
+    double range = 0.0;  // 距离
+    double theta = 0.0;  // 角度(弧度)
+};
+
+// 直角坐标结构
+struct PointRectangular {
+    double x = 0.0;  // x 坐标
+    double y = 0.0;  // y 坐标
+};
+
+// 极坐标转直角坐标函数
+void cal_point(double theta, double range, double &tmp_x, double &tmp_y) {
+    tmp_x = range * std::sin(theta);  
+    tmp_y = range * std::cos(theta);
+}
+
+// 四元数转欧拉角(yaw角，单位：度)
+double quaternion_to_yaw(double x, double y, double z, double w) {
+    double siny = 2.0 * (w * z + x * y);
+    double cosy = 1.0 - 2.0 * (y * y + z * z);
+    return std::atan2(siny, cosy) * 180.0 / M_PI;  // 弧度转角度
+}
+
+class LaserGoNode : public rclcpp::Node {
+private:
+    // 发布者和订阅者
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+
+    // 里程计数据(共享变量)
+    double pos_x_ = 0.0;
+    double pos_y_ = 0.0;
+    double yaw_ = 0.0;  // 偏航角(度)
+    
+    //黄线巡线先让车摆正
+    int flag_yellow_line_ = 0;
+    
+    // 红绿灯停车相关变量
+    bool in_traffic_light_area_ = false;  // 当前是否在红绿灯区域内
+    bool is_stopping_ = false;            // 当前是否正在停车
+    bool has_stopped_in_current_entry_ = false;  // 本次进入区域是否已经停过车
+    rclcpp::Time stop_start_time_;        // 停车开始时间
+    const double STOP_DURATION = 3.0;    // 停车持续时间(秒)
+
+    // 互斥锁(保护共享变量)
+    std::mutex odom_mutex_;
+    
+     // PD 参数（可调整）
+    double Kp = 80.0;    // 比例系数
+    double Kd = 2.8;     // 微分系数（根据需求调整）
+
+    // PD 状态变量（保存上一次误差和时间）
+    double error_ = 0.0;  // 这一次的误差
+    double last_error_ = 0.0;  // 上一次的误差
+    rclcpp::Time last_time_;   // 上一次计算的时间（用于计算微分的时间间隔）
+
+    // 里程计回调函数(更新位置和姿态)
+    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr odom) {
+        std::lock_guard<std::mutex> lock(odom_mutex_);  // 加锁修改共享变量
+        
+        // 读取位置信息
+        pos_x_ = odom->pose.pose.position.x;
+        pos_y_ = odom->pose.pose.position.y;
+
+        // 读取四元数并转换为yaw角
+        auto &orient = odom->pose.pose.orientation;
+        yaw_ = quaternion_to_yaw(orient.x, orient.y, orient.z, orient.w);
+    }
+
+    // 激光雷达回调函数(控制逻辑)
+    void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr laser) {
+        int i = 0, red_cone_Index = 0, blue_cone_Index = 0;
+        int ranges_size = laser->ranges.size();
+        double theta = 0.0, tmp_x = 0.0, tmp_y = 0.0, angle = 0.0;
+        geometry_msgs::msg::Twist twist;
+        
+        //-----------------优先判断直角条件(加锁读取共享变量)---------------
+        {
+            std::lock_guard<std::mutex> lock(odom_mutex_);  // 加锁读取
+            
+            RCLCPP_INFO(this->get_logger(), "position:(%.2f, %.2f),angle:%.2f", pos_x_, pos_y_, yaw_);
+                
+            //直角弯    
+            // 条件：x < -5.5 且 3.25 < y < 4.75 且 yaw在175~185度之间
+            if (pos_x_ <= -5.6 && pos_y_ >= 2.6 && pos_y_ <= 3.90) {
+                twist.linear.x = 1550;  // 左转时的线速度
+                twist.angular.z = 128;   // 左转角速度
+                cmd_vel_pub_->publish(twist);
+                RCLCPP_ERROR(this->get_logger(), "Right angle: turning left");
+                return;  // 满足条件时直接返回，跳过后续逻辑
+            }
+            
+            //大弯
+            if (pos_x_ <= -5.45 && pos_y_ >= 0.2 && pos_y_ <= 2.4) {
+                twist.linear.x = 1550;  // 左转时的线速度
+                twist.angular.z = 112;   // 左转角速度
+                cmd_vel_pub_->publish(twist);
+                RCLCPP_ERROR(this->get_logger(), "Big angle: turning left");
+                return;  // 满足条件时直接返回，跳过后续逻辑
+            }
+            
+            //红绿灯停车处
+            // -------------------------- 红绿灯停车区域检测 --------------------------
+            bool currently_in_area = (pos_x_ >= 3.7 && pos_x_ <= 5.5 && pos_y_ >= 3.25 && pos_y_ <= 4.75);
+            
+            // 检测进入和离开红绿灯区域
+            if (currently_in_area && !in_traffic_light_area_) {
+                // 刚进入红绿灯区域
+                in_traffic_light_area_ = true;
+                has_stopped_in_current_entry_ = false;  // 重置停车标志
+                RCLCPP_INFO(this->get_logger(), "Entered traffic light area");
+            } else if (!currently_in_area && in_traffic_light_area_) {
+                // 刚离开红绿灯区域
+                in_traffic_light_area_ = false;
+                is_stopping_ = false;  // 重置停车状态
+                RCLCPP_INFO(this->get_logger(), "Exited traffic light area");
+            }
+            
+            // 在红绿灯区域内的停车逻辑
+            if (in_traffic_light_area_ && !has_stopped_in_current_entry_) {
+                if (!is_stopping_) {
+                    // 开始停车
+                    is_stopping_ = true;
+                    stop_start_time_ = this->now();
+                    RCLCPP_INFO(this->get_logger(), "Traffic light area detected, starting 3-second stop");
+                }
+                
+                // 检查是否已经停车3秒
+                auto current_time = this->now();
+                double elapsed_time = (current_time - stop_start_time_).seconds();
+                
+                if (elapsed_time < STOP_DURATION) {
+                    // 停车中：发送零速度命令
+                    twist.linear.x = 1400;   // 停止前进
+                    twist.angular.z = 90.0;  // 停止转向
+                    cmd_vel_pub_->publish(twist);
+                    RCLCPP_INFO(this->get_logger(), "STOPPING... Time remaining: %.1f seconds", 
+                               STOP_DURATION - elapsed_time);
+                    return;  // 停车期间直接返回
+                } else {
+                    // 停车完成，标记本次进入已停过车，继续正常行驶
+                    has_stopped_in_current_entry_ = true;
+                    is_stopping_ = false;
+                    RCLCPP_INFO(this->get_logger(), "3-second stop completed, resuming normal operation");
+                    // 不return，继续执行后续的巡锥桶逻辑
+                }
+            }
+            
+
+            // -------------------------- 巡黄线 --------------------------
+            //先矫正方向
+            if (flag_yellow_line_ == 1) {
+                twist.linear.x = SPEED;
+                twist.angular.z = 145;
+                cmd_vel_pub_->publish(twist);
+                //如果矫正完成，则将flag置为2，进入左转
+                if(yaw_ >= -2.0){
+                    flag_yellow_line_ = 2;
+                }
+                RCLCPP_WARN(this->get_logger(), "correcting");
+                return;
+            }
+            
+            //开始左转
+            if (flag_yellow_line_ == 2) {
+                twist.linear.x = SPEED;
+                twist.angular.z = 114;
+                cmd_vel_pub_->publish(twist);
+                //如果左转完成，则重置标志位
+                if(yaw_ >= 170.0){
+                    flag_yellow_line_ = 0;
+                }
+                RCLCPP_WARN(this->get_logger(), "turning_left_yellow_line");
+                return;
+            }
+        }  // 锁自动释放
+
+        // 锥桶数组初始化
+        PointRectangular red_p[30] = {{0.0, 0.0}};    // 红色锥桶
+        PointRectangular blue_p[30] = {{0.0, 0.0}};   // 蓝色锥桶
+
+        // 第一步：筛选有效锥桶
+        for (i = 1; i <= (ranges_size - 6); i++) {
+            // 通过相邻点距离差判断锥桶反射点
+            if ((std::isfinite(laser->ranges[i])) &&   
+                (laser->ranges[i] <= 2.5) &&  
+                (laser->ranges[i-1] - laser->ranges[i] >= 2.0) &&          
+                (std::abs(laser->ranges[i] - laser->ranges[i+1]) <= 0.15) &&
+                (std::abs(laser->ranges[i+1] - laser->ranges[i+2]) <= 0.15) &&
+                (std::abs(laser->ranges[i+2] - laser->ranges[i+3]) <= 0.15) &&
+                (std::abs(laser->ranges[i+3] - laser->ranges[i+4]) <= 0.15) &&
+                (std::abs(laser->ranges[i+4] - laser->ranges[i+5]) <= 0.15)) {
+                theta = i * laser->angle_increment + laser->angle_min;
+                cal_point(theta, laser->ranges[i], tmp_x, tmp_y);
+
+                // 筛选选范围内的有效点
+                if ((tmp_x <= 1.5 && tmp_x >= -1.5) && (tmp_y <= 2.0 && tmp_y >= -0.1)) {
+                    if (tmp_x > 0) {  // 右侧锥桶
+                        red_p[red_cone_Index].x = tmp_x;
+                        red_p[red_cone_Index].y = tmp_y;
+                        red_cone_Index++;
+                    } else {  // 左侧锥桶
+                        blue_p[blue_cone_Index].x = tmp_x;
+                        blue_p[blue_cone_Index].y = tmp_y;
+                        blue_cone_Index++;
+                    }
+                }
+            }
+        }
+
+//        // -------------------------- 如果发现一个红色锥桶，就左转 --------------------------
+//        if (red_cone_Index == 1) {
+//            twist.linear.x = SPEED;
+//            twist.angular.z = 150;          // 左转
+//            // 发布速度指令（控制小车运动）
+//            cmd_vel_pub_->publish(twist);
+//            RCLCPP_WARN(this->get_logger(), "into_yellow_line");
+//            return;
+//        }
+        
+        //----进入黄线区域，将标志位置1---
+        if (red_cone_Index == 0) {
+            flag_yellow_line_ = 1;
+            twist.linear.x = SPEED;
+            twist.angular.z = 145;
+            cmd_vel_pub_->publish(twist);
+            RCLCPP_WARN(this->get_logger(), "into_yellow_line");
+            return;
+        }
+
+
+
+        // 第二步：合并锥桶组(蓝色锥桶数量多于红色时)
+        if (blue_cone_Index >= red_cone_Index) {
+            int m = 100;  // 边界点标记
+            for (int i = 1; i <= blue_cone_Index - 1; i++) {
+                double dist = std::sqrt(
+                    std::pow(blue_p[i-1].x - blue_p[i].x, 2) + 
+                    std::pow(blue_p[i-1].y - blue_p[i].y, 2)
+                );
+                if (dist >= 1.4) {
+                    m = i;
+                    break;
+                }
+            }
+            if (m != 100) {
+                // 红色红色锥桶后移
+                for (int i = red_cone_Index - 1; i >= 0; i--) {
+                    red_p[i + blue_cone_Index - m] = red_p[i];
+                }
+                // 边界后的蓝色蓝色锥桶转为红色
+                for (int i = 0; i <= blue_cone_Index - m - 1; i++) {
+                    red_p[i] = blue_p[m + i];
+                }
+                red_cone_Index += (blue_cone_Index - m);
+                blue_cone_Index = m;
+            }
+        } else {  // 红色锥桶数量多于蓝色时
+            int m = 100;
+            for (int i = red_cone_Index - 2; i >= 0; i--) {
+                double dist = std::sqrt(
+                    std::pow(red_p[i].x - red_p[i+1].x, 2) + 
+                    std::pow(red_p[i].y - red_p[i+1].y, 2)
+                );
+                if (dist >= 1.4) {
+                    m = i;
+                }
+            }
+            if (m != 100) {
+                // 边界前的红色红色锥桶转为蓝色
+                for (int i = 0; i <= m; i++) {
+                    blue_p[blue_cone_Index + i] = red_p[i];
+                }
+                // 红色锥桶前移
+                for (int i = 0; i <= red_cone_Index - m - 2; i++) {
+                    red_p[i] = red_p[i + m + 1];
+                }
+                red_cone_Index -= (m + 1);
+                blue_cone_Index += (m + 1);
+            }
+        }
+        
+/*
+        // 打印锥桶信息
+        for (int i = 0; i < red_cone_Index; i++) {
+            RCLCPP_INFO(this->get_logger(), "red_bucket:(%.2f, %.2f)", red_p[i].x, red_p[i].y);
+        }
+        for (int i = 0; i < blue_cone_Index; i++) {
+            RCLCPP_INFO(this->get_logger(), "blue_bucket:(%.2f, %.2f)", blue_p[i].x, blue_p[i].y);
+        }
+*/
+
+        // 第三步：统一锥桶数量
+        if (red_cone_Index > blue_cone_Index) {
+            red_cone_Index = blue_cone_Index;
+        } else {
+            blue_cone_Index = red_cone_Index;
+        }
+
+        // 1.计算误差(带权重滤波),前馈
+        double gamma = 0.7;
+        error_ = 0.0; 
+        for (i = 0; i <= red_cone_Index - 1; i++) {
+            //error_ = gamma * error + (blue_p[i].x + red_p[red_cone_Index - i - 1].x);
+            error_ = gamma * error_ + (-0.7 + red_p[i].x);
+        }
+        
+        // 2. 计算时间间隔（微分项需要基于时间变化率）
+        rclcpp::Time current_time = this->now();
+        double dt = (current_time - last_time_).seconds();  // 时间间隔（秒）
+        // 首次运行时初始化时间（避免 dt 为 0 导致微分计算错误）
+        if (dt <= 0.0) {
+            last_time_ = current_time;
+            last_error_ = error_;  // 初始化上一次误差
+            return;
+        }
+
+        // 3. 计算微分项（误差变化率 = (当前误差 - 上一次误差) / 时间间隔）
+        double derivative = (error_ - last_error_) / dt;
+
+//        double deriv_limit = 5.0;  // 微分项最大波动限制
+//        if (derivative > deriv_limit) derivative = deriv_limit;
+//        if (derivative < -deriv_limit) derivative = -deriv_limit;
+
+        // 4. 计算 PD 总输出（转向角度）
+        angle = Kp * error_ - Kd * derivative;
+
+        // 5. 保存当前状态，供下一次计算使用
+        last_error_ = error_;    // 更新上一次误差
+        last_time_ = current_time;  // 更新上一次时间
+        
+        // 新增日志：打印误差、微分项、最终角度
+        //RCLCPP_INFO(this->get_logger(), "error: %.2f, deriv: %.2f, angle: %.2f", error_, derivative, angle);
+
+        // 第四步：设置速度指令
+        twist.angular.z = 90 + angle;
+        if (twist.angular.z > 150) twist.angular.z = 150;
+        if (twist.angular.z < 30) twist.angular.z = 30;
+
+        twist.linear.x = SPEED;
+        twist.angular.x = 0.0;
+        twist.angular.y = 0.0;
+        twist.linear.y = 0.0;
+        twist.linear.z = 0.0;
+
+        cmd_vel_pub_->publish(twist);
+    }
+
+public:
+    LaserGoNode() : Node("laser_go1"), last_time_(this->now()), stop_start_time_(this->now()) {
+        // 初始化发布者
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/teleop_cmd_vel", 5);
+
+        // 初始化激光雷达订阅者
+        laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            "/scan", 5,
+            std::bind(&LaserGoNode::laser_callback, this, std::placeholders::_1)
+        );
+
+        // 初始化里程计订阅者
+        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/odom_combined", 5,
+            std::bind(&LaserGoNode::odom_callback, this, std::placeholders::_1)
+        );
+
+        RCLCPP_INFO(this->get_logger(), "LaserGoNode1 initialized!");
+    }
+};
+
+int main(int argc, char *argv[]) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<LaserGoNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

@@ -1,0 +1,232 @@
+#include "rclcpp/rclcpp.hpp"                  // ROS 2 核心头文件
+#include "sensor_msgs/msg/laser_scan.hpp"     // ROS 2 激光雷达消息
+#include "geometry_msgs/msg/twist.hpp"        // ROS 2 速度控制消息
+#include <cmath>                               // C++ 数学库
+#include "Control.h"                           // 自定义 PID 控制器头文件
+
+#define SPEED 35   // 预设线速度值（原 speed），后被处理：SPEED+1500
+
+// 1. 极坐标系结构体
+struct PointPolar {   
+    double range = 0.0;  // 距离（初始化避免随机值）
+    double theta = 0.0;  // 角度（弧度，初始化避免随机值）
+};
+
+// 2. 直角坐标系结构体
+struct PointRectangular {
+    double x = 0.0;  // x 坐标
+    double y = 0.0;  // y 坐标
+};
+
+// 全局 PID 控制器
+Control::PID pid;
+
+// 3. 极坐标转直角坐标函数
+void cal_point(double theta, double range, double &tmp_x, double &tmp_y) {
+    tmp_x = range * std::sin(theta);  // 注意：ROS 2 需加 std::（cmath 函数在 std 命名空间）
+    tmp_y = range * std::cos(theta);
+}
+
+// 4. 节点类（替代 ROS 1 的 PubAndSub，继承 rclcpp::Node）
+class LaserGoNode : public rclcpp::Node {
+private:
+    // ROS 2 发布者（智能指针类型，替代 ros::Publisher）
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    // ROS 2 订阅者（智能指针类型，替代 ros::Subscriber）
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
+
+    // 全局变量：低通滤波值（与 ROS 1 一致）
+    float low_pass_val = 0.0;
+
+    // 5. 激光雷达回调函数（核心逻辑保留，适配 ROS 2 消息类型）
+    void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr laser) {
+        int i = 0, red_cone_Index = 0, blue_cone_Index = 0; //红:red_cone_Index  蓝:blue_cone_Index
+        int ranges_size = laser->ranges.size(); // 每转一圈雷达扫描次数
+        double error = 0.0, theta = 0.0, tmp_x = 0.0, tmp_y = 0.0, angle = 0.0;
+        geometry_msgs::msg::Twist twist;  // ROS 2 速度消息（类型后缀加 msg::）
+        
+        // 红蓝锥桶数组（初始化成员，避免随机值）
+        PointRectangular red_p[30] = {{0.0, 0.0}};    // 红色锥桶
+        PointRectangular blue_p[30] = {{0.0, 0.0}};   // 蓝色锥桶
+        PointRectangular* p = red_p;                  // 用于误差计算的红锥桶指针
+
+        // -------------------------- 第一步：初步筛选红蓝锥桶 --------------------------
+        for (i = 1; i < ranges_size; i++) {
+            // 检测距离突变且在有效范围内的点（判断是否为锥桶边缘）
+            //当前时刻和上一时刻比，当前时刻才是有效的
+            if ((laser->ranges[i-1] - laser->ranges[i] >= 2.0) && 
+                (laser->ranges[i] < 2.5) && 
+                (std::isfinite(laser->ranges[i]))) {
+                theta = i * laser->angle_increment + laser->angle_min;
+                // 极坐标转直角坐标
+                cal_point(theta, laser->ranges[i], tmp_x, tmp_y);
+
+                // 筛选有效锥桶（限定坐标范围，排除无效点）
+                if ((tmp_x <= 1.5 && tmp_x >= -1.5) && (tmp_y < 2.0 && tmp_y > -0.1)) {
+                    // 左方锥桶（x>0）标记为红色，且距离<1.5米
+                    if (tmp_x > 0) {
+                        red_p[red_cone_Index].x = tmp_x;
+                        red_p[red_cone_Index].y = tmp_y;
+                        red_cone_Index++;  // 红色锥桶计数（最多30个）
+                    } 
+                    // 右方锥桶（x<=0）标记为蓝色
+                    else {
+                        blue_p[blue_cone_Index].x = tmp_x;
+                        blue_p[blue_cone_Index].y = tmp_y;
+                        blue_cone_Index++;  // 蓝色锥桶计数（最多30个）
+                    }
+                }
+            }
+        }
+
+        // -------------------------- 第二步：修正锥桶分组（避免误分类） --------------------------
+        // 情况1：蓝色锥桶数量多于红色（可能存在误分类，将部分红桶归为蓝桶），在右转弯处
+        if (blue_cone_Index >= red_cone_Index) {
+            int m = 100;  // 标记误分类的起始索引（初始值为无效值）
+            // 遍历蓝桶，找距离超过1.4米的间隔（判断是否为分组边界）
+            for (int i = 1; i <= blue_cone_Index - 1; i++) {
+                double dist = std::sqrt(
+                    std::pow(blue_p[i-1].x - blue_p[i].x, 2) + 
+                    std::pow(blue_p[i-1].y - blue_p[i].y, 2)
+                );
+                if (dist > 1.4) {
+                    m = i;  // 记录分组边界,比如m=i=3,bcindex=5,rcindex=2,加减bcindex-m=2
+                    break;
+                }
+            }
+            // 存在误分类，调整红蓝桶归属
+            if (m != 100) {
+                // 红桶后移，腾出空间给误分类的蓝桶
+                for (int i = red_cone_Index - 1; i >= 0; i--) {
+                    red_p[i + blue_cone_Index - m] = red_p[i];
+                }
+                // 将边界后的蓝桶归为红桶
+                for (int i = 0; i <= blue_cone_Index - m - 1; i++) {
+                    red_p[i] = blue_p[m + i];
+                }
+                // 更新红蓝桶计数
+                red_cone_Index += (blue_cone_Index - m);
+                blue_cone_Index = m;
+            }
+        } 
+        // 情况2：红色锥桶数量多于蓝色（类似逻辑，将部分蓝桶归为红桶），在左转弯处
+        else {
+            int m = 100;  // 标记误分类的起始索引
+            // 遍历红桶，找距离超过1.4米的间隔
+            for (int i = red_cone_Index - 2; i >= 0; i--) { //从标准红桶（索引最大-1）开始遍历
+                double dist = std::sqrt(
+                    std::pow(red_p[i].x - red_p[i+1].x, 2) + 
+                    std::pow(red_p[i].y - red_p[i+1].y, 2)
+                );
+                if (dist > 1.4) {
+                    m = i;  // 记录分组边界
+                }
+            }
+            // 存在误分类，调整红蓝桶归属
+            if (m != 100) {
+                // 将边界前的红桶归为蓝桶
+                for (int i = 0; i <= m; i++) {
+                    blue_p[blue_cone_Index + i] = red_p[i];
+                }
+                // 红桶前移，删除已归为蓝桶的元素
+                for (int i = 0; i <= red_cone_Index - m - 2; i++) {
+                    red_p[i] = red_p[i + m + 1];
+                }
+                // 更新红蓝桶计数
+                red_cone_Index -= (m + 1);
+                blue_cone_Index += (m + 1);
+            }
+        }
+
+        // 打印筛选后的红锥桶坐标
+        for (int i = 0; i <= red_cone_Index - 1; i++) {
+            RCLCPP_INFO(this->get_logger(), "red_bucket:(%.2f, %.2f),lidar scan times:%d", red_p[i].x, red_p[i].y, ranges_size);
+        }
+        // 打印筛选后的蓝锥桶坐标
+        for (int i = 0; i <= blue_cone_Index - 1; i++) {
+            RCLCPP_INFO(this->get_logger(), "blue_bucket:(%.2f, %.2f),lidar scan times:%d", blue_p[i].x, blue_p[i].y, ranges_size);
+        }
+        
+
+
+        // -------------------------- 第三步：计算误差与 PID 控制 --------------------------
+        // 取红蓝桶数量一致（避免误差计算失衡）
+        if (red_cone_Index > blue_cone_Index) {
+            p += (red_cone_Index - blue_cone_Index);  // 红桶指针后移，匹配蓝桶数量
+            red_cone_Index = blue_cone_Index;         // 如果红多蓝少，统一数量为蓝桶数量
+        } else {
+            blue_cone_Index = red_cone_Index;         // 如果蓝多红少，统一数量为红桶数量
+        }
+
+        // 误差累计（加权递推，gamma=0.8 为权重）
+        double gamma = 0.8;
+        for (i = blue_cone_Index - 1; i >= 0; i--) {
+            //error = gamma * error + (blue_p[i].x + p->x);  // 误差公式，从远到近，如果左右锥桶的中心在车左边，则error>0
+            error = gamma * error + (blue_p[i].x + red_p[red_cone_Index - i -1].x);  // 误差公式，从远到近，如果左右锥桶的中心在车左边，则error>0
+            p++;  // 红桶指针后移，匹配蓝桶索引
+        }
+
+        // PID 计算角度输出（调用自定义 PID 控制器的位置式计算函数）
+        //angle = pid.PIDPositional(error * 10);  // 误差放大10倍，增强控制灵敏度
+        angle = error * 70;
+
+        // -------------------------- 第四步：构造速度控制指令 --------------------------
+        // 角速度控制（z轴旋转，0~180 范围限制，对应舵机角度或转向角度）
+        twist.angular.z = 90 + angle;  // 85 为基准值，angle 为 PID 调节量
+        if (twist.angular.z > 150) twist.angular.z = 150;  // 上限限制
+        if (twist.angular.z < 30) twist.angular.z = 30;      // 下限限制
+
+        // 线速度控制（x轴前进，误差小时提速）
+        twist.linear.x = SPEED;  // 基础线速度
+        //if (std::abs(angle) <= 10) twist.linear.x += 10;  // 角度误差小，线速度+10
+
+        // 其他轴置0（无横向/纵向旋转、无侧向移动）
+        twist.angular.x = 0.0;
+        twist.angular.y = 0.0;
+        twist.linear.y = 0.0;
+        twist.linear.z = 0.0;
+
+        // 发布速度指令（控制小车运动）
+        cmd_vel_pub_->publish(twist);
+        //RCLCPP_INFO(this->get_logger(), "red_buckets:%d ,blue_buckets:%d", red_cone_Index, blue_cone_Index);
+        //RCLCPP_INFO(this->get_logger(), "PID error:%.2f,turning_angle:%.2f", error, twist.angular.z);
+
+    }
+
+public:
+    // 6. 节点构造函数（初始化 ROS 2 节点、发布者、订阅者）
+    LaserGoNode() : Node("laser_go") {  // 节点名：laser_go（与 ROS 1 一致）
+        // 初始化 PID 控制器（与 ROS 1 一致，假设 Control::PID::Init() 无 ROS 依赖）
+        pid.Init();
+
+        // 创建速度发布者（话题：/car/cmd_vel，队列大小5）
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/teleop_cmd_vel", 5);
+
+        // 创建激光雷达订阅者（话题：/scan，队列大小5，绑定回调函数）
+        laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            "/scan", 5,
+            std::bind(&LaserGoNode::laser_callback, this, std::placeholders::_1)
+        );
+
+        // 日志输出（ROS 2 用 RCLCPP_INFO 替代 ROS_INFO）
+        RCLCPP_INFO(this->get_logger(), "LaserGoNode has been initialized!");
+    }
+};
+
+// 7. 主函数（ROS 2 节点入口）
+int main(int argc, char *argv[]) {
+    // 初始化 ROS 2 上下文（替代 ros::init）
+    rclcpp::init(argc, argv);
+
+    // 创建节点实例（智能指针，ROS 2 推荐用法）
+    auto node = std::make_shared<LaserGoNode>();
+
+    // 自旋节点（处理回调函数，替代 ros::spin）
+    rclcpp::spin(node);
+
+    // 关闭 ROS 2 上下文（替代 ros::shutdown）
+    rclcpp::shutdown();
+    return 0;
+}
+
+

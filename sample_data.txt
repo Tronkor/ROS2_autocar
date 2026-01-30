@@ -1,0 +1,12 @@
+# 示例文本文件内容
+Hello, this is a sample text file for ROS2 file reading demo.
+
+Line 2: Current timestamp would be here
+Line 3: Some sensor data: 25.6, 30.2, 15.8
+Line 4: Status: OK
+Line 5: End of file
+
+Additional data:
+- Temperature: 23.5°C
+- Humidity: 65%
+- Pressure: 1013.25 hPa

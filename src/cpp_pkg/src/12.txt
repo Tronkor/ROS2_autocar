@@ -1,0 +1,254 @@
+#include "rclcpp/rclcpp.hpp"                  // ROS 2 核心头文件
+#include "sensor_msgs/msg/laser_scan.hpp"     // ROS 2 激光雷达消息
+#include "geometry_msgs/msg/twist.hpp"        // ROS 2 速度控制消息
+#include "car_interfaces/msg/if_right_corner.hpp"  // 自定义直角消息
+#include <cmath>                              // C++ 数学库
+#include "Control.h"                          // 自定义 PID 控制器头文件
+
+#define SPEED 1545   // 预设线速度值
+#define RIGHT_CORNER_TOPIC "right_corner"     // 直角消息的话题名（需与发布者一致）
+
+//版本12
+
+// 1. 极坐标系结构体
+struct PointPolar {   
+    double range = 0.0;  // 距离（初始化避免随机值）
+    double theta = 0.0;  // 角度（弧度，初始化避免随机值）
+};
+
+// 2. 直角坐标系结构体
+struct PointRectangular {
+    double x = 0.0;  // x 坐标
+    double y = 0.0;  // y 坐标
+};
+
+// 3. 向量结构体
+struct VectorQuantity {
+    double a = 0.0;  // x 坐标
+    double b = 0.0;  // y 坐标
+};
+
+// 全局 PID 控制器
+Control::PID pid;
+
+// 3. 极坐标转直角坐标函数
+void cal_point(double theta, double range, double &tmp_x, double &tmp_y) {
+    tmp_x = range * std::sin(theta);  
+    tmp_y = range * std::cos(theta);
+}
+
+// 4. 节点类（继承 rclcpp::Node）
+class LaserGoNode : public rclcpp::Node {
+private:
+    // ROS 2 发布者（速度指令）
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    // ROS 2 订阅者（激光雷达、直角消息）
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
+    rclcpp::Subscription<car_interfaces::msg::IfRightCorner>::SharedPtr corner_sub_;  // 新增：直角消息订阅者
+    
+    // 新增：直角标志（0=未到直角，1=到达直角）
+    bool is_right_corner_ = false;
+    // 新增：直角状态锁（避免多线程数据竞争）
+    std::mutex corner_mutex_;
+
+
+    // 新增：5. 直角消息回调函数（接收 IfRightCorner 消息）
+    void corner_callback(const car_interfaces::msg::IfRightCorner::SharedPtr corner_msg) {
+        std::lock_guard<std::mutex> lock(corner_mutex_);  // 加锁保护共享变量
+        // 更新直角标志：msg->if_right_corner 为 1 时设为 true，否则 false
+        is_right_corner_ = (corner_msg->if_right_corner == 1);
+        
+        // 可选：打印直角消息状态（调试用）
+        if (is_right_corner_) {
+            RCLCPP_INFO(this->get_logger(), "right corner: YES (start turning left)");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "right corner: NO (continue tracking)");
+        }
+    }
+
+
+    // 6. 激光雷达回调函数（原有逻辑，新增直角判断优先级）
+    void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr laser) {
+        // -------------------------- 新增：优先判断直角，到达则左转 --------------------------
+        {
+            std::lock_guard<std::mutex> lock(corner_mutex_);  // 加锁读取标志
+            if (is_right_corner_) {
+                geometry_msgs::msg::Twist twist;
+                twist.linear.x = SPEED;          // 保持线速度
+                twist.angular.z = 130;          // 固定左转角度（与原有直角逻辑一致）
+                twist.angular.x = 0.0;
+                twist.angular.y = 0.0;
+                twist.linear.y = 0.0;
+                twist.linear.z = 0.0;
+                
+                cmd_vel_pub_->publish(twist);
+                RCLCPP_INFO(this->get_logger(), "Right corner detected: turning left");
+                return;  // 跳过后续循迹逻辑，专注左转
+            }
+        }  // 锁在此处自动释放
+
+
+        // -------------------------- 原有激光雷达循迹逻辑（不变） --------------------------
+        int i = 0, red_cone_Index = 0, blue_cone_Index = 0; //红:red_cone_Index  蓝:blue_cone_Index
+        int ranges_size = laser->ranges.size(); // 每转一圈雷达扫描次数
+        double error = 0.0, theta = 0.0, tmp_x = 0.0, tmp_y = 0.0, angle = 0.0;
+        geometry_msgs::msg::Twist twist;  // ROS 2 速度消息
+        
+        // 红蓝锥桶数组（初始化成员，避免随机值）
+        PointRectangular red_p[30] = {{0.0, 0.0}};    // 红色锥桶
+        PointRectangular blue_p[30] = {{0.0, 0.0}};   // 蓝色锥桶
+
+        // 第一步：初步筛选红蓝锥桶
+        for (i = 1; i < ranges_size; i++) {
+            if ((laser->ranges[i-1] - laser->ranges[i] >= 2.0) && 
+                (laser->ranges[i] < 2.5) && 
+                (std::isfinite(laser->ranges[i]))) {
+                theta = i * laser->angle_increment + laser->angle_min;
+                cal_point(theta, laser->ranges[i], tmp_x, tmp_y);
+
+                if ((tmp_x <= 1.3 && tmp_x >= -1.3) && (tmp_y <= 2.0 && tmp_y >= -0.1)) {
+                    if (tmp_x > 0) {
+                        red_p[red_cone_Index].x = tmp_x;
+                        red_p[red_cone_Index].y = tmp_y;
+                        red_cone_Index++;
+                    } else {
+                        blue_p[blue_cone_Index].x = tmp_x;
+                        blue_p[blue_cone_Index].y = tmp_y;
+                        blue_cone_Index++;
+                    }
+                }
+            }
+        }
+
+        // 如果发现一个红色锥桶，就左转
+//        if (red_cone_Index == 1) {
+//            twist.linear.x = SPEED;
+//            twist.angular.z = 150;          
+//            cmd_vel_pub_->publish(twist);
+//            RCLCPP_INFO(this->get_logger(), "into_yellow_line");
+//            return;
+//        }
+
+        // 如果没有发现红色锥桶，就左转
+        if (red_cone_Index == 0) {
+            twist.linear.x = SPEED;
+            twist.angular.z = 117;          
+            cmd_vel_pub_->publish(twist);
+            RCLCPP_INFO(this->get_logger(), "into_yellow_line");
+            return;
+        }
+
+        
+
+        // 第二步：修正锥桶分组（避免误分类）
+        if (blue_cone_Index >= red_cone_Index) {
+            int m = 100;
+            for (int i = 1; i <= blue_cone_Index - 1; i++) {
+                double dist = std::sqrt(
+                    std::pow(blue_p[i-1].x - blue_p[i].x, 2) + 
+                    std::pow(blue_p[i-1].y - blue_p[i].y, 2)
+                );
+                if (dist > 1.4) {
+                    m = i;
+                    break;
+                }
+            }
+            if (m != 100) {
+                for (int i = red_cone_Index - 1; i >= 0; i--) {
+                    red_p[i + blue_cone_Index - m] = red_p[i];
+                }
+                for (int i = 0; i <= blue_cone_Index - m - 1; i++) {
+                    red_p[i] = blue_p[m + i];
+                }
+                red_cone_Index += (blue_cone_Index - m);
+                blue_cone_Index = m;
+            }
+        } else {
+            int m = 100;
+            for (int i = red_cone_Index - 2; i >= 0; i--) {
+                double dist = std::sqrt(
+                    std::pow(red_p[i].x - red_p[i+1].x, 2) + 
+                    std::pow(red_p[i].y - red_p[i+1].y, 2)
+                );
+                if (dist > 1.4) {
+                    m = i;
+                }
+            }
+            if (m != 100) {
+                for (int i = 0; i <= m; i++) {
+                    blue_p[blue_cone_Index + i] = red_p[i];
+                }
+                for (int i = 0; i <= red_cone_Index - m - 2; i++) {
+                    red_p[i] = red_p[i + m + 1];
+                }
+                red_cone_Index -= (m + 1);
+                blue_cone_Index += (m + 1);
+            }
+        }
+
+        // 打印筛选后的锥桶坐标
+        for (int i = 0; i <= red_cone_Index - 1; i++) {
+            RCLCPP_INFO(this->get_logger(), "red_bucket:(%.2f, %.2f),lidar scan times:%d", red_p[i].x, red_p[i].y, ranges_size);
+        }
+        for (int i = 0; i <= blue_cone_Index - 1; i++) {
+            RCLCPP_INFO(this->get_logger(), "blue_bucket:(%.2f, %.2f),lidar scan times:%d", blue_p[i].x, blue_p[i].y, ranges_size);
+        }
+
+        // 第三步：计算误差与 PID 控制
+        if (red_cone_Index > blue_cone_Index) {
+            red_cone_Index = blue_cone_Index;
+        } else {
+            blue_cone_Index = red_cone_Index;
+        }
+
+        double gamma = 0.8;
+        for (i = blue_cone_Index - 1; i >= 0; i--) {
+            error = gamma * error + (blue_p[i].x + red_p[red_cone_Index - i -1].x); 
+        }
+
+        angle = error * 75;
+
+        // 第四步：构造速度控制指令
+        twist.angular.z = 90 + angle;
+        if (twist.angular.z > 150) twist.angular.z = 150;
+        if (twist.angular.z < 30) twist.angular.z = 30;
+
+        twist.linear.x = SPEED;
+        twist.angular.x = 0.0;
+        twist.angular.y = 0.0;
+        twist.linear.y = 0.0;
+        twist.linear.z = 0.0;
+
+        cmd_vel_pub_->publish(twist);
+    }
+
+public:
+    // 7. 节点构造函数（新增直角订阅者初始化）
+    LaserGoNode() : Node("laser_go") {  
+        // 创建速度发布者（话题：/teleop_cmd_vel，队列大小5）
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/teleop_cmd_vel", 5);
+
+        // 创建激光雷达订阅者（原有）
+        laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            "/scan", 5,
+            std::bind(&LaserGoNode::laser_callback, this, std::placeholders::_1)
+        );
+
+        // 新增：创建直角消息订阅者（话题：RIGHT_CORNER_TOPIC，队列大小5）
+        corner_sub_ = this->create_subscription<car_interfaces::msg::IfRightCorner>(
+            "/right_corner", 5,
+            std::bind(&LaserGoNode::corner_callback, this, std::placeholders::_1)
+        );
+
+        RCLCPP_INFO(this->get_logger(), "LaserGoNode initialized (with right corner detection)!");
+    }
+};
+
+// 8. 主函数
+int main(int argc, char *argv[]) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<LaserGoNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

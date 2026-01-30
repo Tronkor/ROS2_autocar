@@ -1,0 +1,158 @@
+#include "rclcpp/rclcpp.hpp"                  // ROS 2 核心头文件
+#include "sensor_msgs/msg/laser_scan.hpp"     // ROS 2 激光雷达消息
+#include "geometry_msgs/msg/twist.hpp"        // ROS 2 速度控制消息
+#include <cmath>                              // C++ 数学库
+#include "Control.h"                          // 自定义 PID 控制器头文件
+
+#define SPEED 1550   // 预设线速度值（
+
+// 1. 极坐标系结构体
+struct PointPolar {   
+    double range = 0.0;  // 距离（初始化避免随机值）
+    double theta = 0.0;  // 角度（弧度，初始化避免随机值）
+};
+
+// 2. 直角坐标系结构体
+struct PointRectangular {
+    double x = 0.0;  // x 坐标
+    double y = 0.0;  // y 坐标
+};
+
+// 3. 向量结构体
+struct VectorQuantity {
+    double a = 0.0;  // x 坐标
+    double b = 0.0;  // y 坐标
+};
+
+// 全局 PID 控制器
+Control::PID pid;
+
+// 3. 极坐标转直角坐标函数
+void cal_point(double theta, double range, double &tmp_x, double &tmp_y) {
+    tmp_x = range * std::sin(theta);  
+    tmp_y = range * std::cos(theta);
+}
+
+// 4. 节点类（替代 ROS 1 的 PubAndSub，继承 rclcpp::Node）
+class LaserGoNode : public rclcpp::Node {
+private:
+    // ROS 2 发布者（智能指针类型）
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    // ROS 2 订阅者（智能指针类型）
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
+
+    // 5. 激光雷达回调函数
+    void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr laser) {
+        int i = 0, red_cone_Index = 0; //红:red_cone_Index  蓝:blue_cone_Index
+        int ranges_size = laser->ranges.size(); // 每转一圈雷达扫描次数
+        double error = 0.0, theta = 0.0, tmp_x = 0.0, tmp_y = 0.0, angle = 0.0;
+        geometry_msgs::msg::Twist twist;  // ROS 2 速度消息,实例化对象（类型后缀加 msg::）
+        
+        // 红蓝锥桶数组（初始化成员，避免随机值）
+        PointRectangular red_p[30] = {{0.0, 0.0}};    // 红色锥桶
+
+        // -------------------------- 第一步：初步筛选红蓝锥桶 --------------------------
+        for (i = 1; i < ranges_size; i++) {
+            // 检测距离突变且在有效范围内的点（判断是否为锥桶边缘）
+            //当前时刻和上一时刻比，当前时刻才是有效的
+            if ((laser->ranges[i-1] - laser->ranges[i] >= 2.0) && 
+                (laser->ranges[i] < 1.25) && 
+                (std::isfinite(laser->ranges[i]))) {
+                theta = i * laser->angle_increment + laser->angle_min;
+                // 极坐标转直角坐标
+                cal_point(theta, laser->ranges[i], tmp_x, tmp_y);
+
+                // 筛选有效锥桶（限定坐标范围，排除无效点）
+                if ((tmp_x >= 0 && tmp_x <= 0.75) && (tmp_y <= 1.0 && tmp_y >= -0.1)) {
+                    red_p[red_cone_Index].x = tmp_x;
+                    red_p[red_cone_Index].y = tmp_y;
+                    red_cone_Index++;  // 红色锥桶计数（最多30个）
+                }
+            }
+        }
+
+        // -------------------------- 如果没有发现红色锥桶，就左转 --------------------------
+        if (red_cone_Index == 0) {
+            twist.linear.x = SPEED;
+            twist.angular.z = 125;          // 左转
+            // 发布速度指令（控制小车运动）
+            cmd_vel_pub_->publish(twist);
+            RCLCPP_INFO(this->get_logger(), "into_yellow_line,front 0 redcone");
+            return;
+        }
+        
+        if (red_cone_Index >= 2) {
+            twist.linear.x = SPEED;
+            twist.angular.z = 138;          // 左转
+            // 发布速度指令（控制小车运动）
+            cmd_vel_pub_->publish(twist);
+            RCLCPP_INFO(this->get_logger(), "fuck!!");
+            return;
+        }
+
+
+        // -------------------------- 第三步：计算误差与 PID 控制 --------------------------
+        error = -0.70  + red_p[0].x; 
+        angle = error * 80;
+
+        // -------------------------- 第四步：构造速度控制指令 --------------------------
+        // 角速度控制（z轴旋转，0~180 范围限制，对应舵机角度或转向角度）
+        twist.angular.z = 90 + angle;  // 85 为基准值，angle 为 PID 调节量
+        if (twist.angular.z > 150) twist.angular.z = 150;  // 上限限制
+        if (twist.angular.z < 30) twist.angular.z = 30;      // 下限限制
+
+        // 线速度控制（x轴前进，误差小时提速）
+        twist.linear.x = SPEED;  // 基础线速度
+        //if (std::abs(angle) <= 10) twist.linear.x += 10;  // 角度误差小，线速度+10
+
+        // 其他轴置0（无横向/纵向旋转、无侧向移动）
+        twist.angular.x = 0.0;
+        twist.angular.y = 0.0;
+        twist.linear.y = 0.0;
+        twist.linear.z = 0.0;
+
+        // 发布速度指令（控制小车运动）
+        cmd_vel_pub_->publish(twist);
+        //RCLCPP_INFO(this->get_logger(), "red_buckets:%d ,blue_buckets:%d", red_cone_Index, blue_cone_Index);
+        //RCLCPP_INFO(this->get_logger(), "PID error:%.2f,turning_angle:%.2f", error, twist.angular.z);
+
+    }
+
+public:
+    // 6. 节点构造函数（初始化 ROS 2 节点、发布者、订阅者）
+    LaserGoNode() : Node("laser_go") {  // 节点名：laser_go（与 ROS 1 一致）
+        // 初始化 PID 控制器
+        pid.Init();
+
+        // 创建速度发布者（话题：/car/cmd_vel，队列大小5）
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/teleop_cmd_vel", 5);
+
+        // 创建激光雷达订阅者（话题：/scan，队列大小5，绑定回调函数）
+        laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            "/scan", 5,
+            std::bind(&LaserGoNode::laser_callback, this, std::placeholders::_1)
+        );
+
+        RCLCPP_INFO(this->get_logger(), "LaserGoNode has been initialized!");
+    }
+};
+
+// 7. 主函数（ROS 2 节点入口）
+int main(int argc, char *argv[]) {
+    rclcpp::init(argc, argv);
+
+    // 创建节点实例（智能指针）
+    auto node = std::make_shared<LaserGoNode>();
+
+    // 自旋节点（处理回调函数）
+    rclcpp::spin(node);
+
+    // 这里spin_some仅用于维持节点，实际任务已在start_continuous_task中执行
+    //rclcpp::spin_some(node);
+
+    // 关闭 ROS 2 上下文
+    rclcpp::shutdown();
+    return 0;
+}
+
+
